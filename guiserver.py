@@ -5,7 +5,7 @@ from kivy import Logger
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.properties import BooleanProperty, ObjectProperty
-from kivy.clock import Clock
+from kivy.clock import Clock, mainthread
 
 from plyer import ble_central, ble_peripheral
 from plyer.utils import iprop
@@ -49,9 +49,9 @@ class ModuleServerApp(App):
 
 	def on_start(self):
 		ble_central.init()
-		ble_central.set_callbacks(on_state=self.central_state_changed)
-		# ble_central.set_callbacks(on_state=self.central_state_changed,
-		#                           on_discover=self.central_discovered_peripheral)
+		# ble_central.set_callbacks(on_state=self.central_state_changed)
+		ble_central.set_callbacks(on_state=self.central_state_changed,
+		                          on_discover=self.central_discovered_peripheral)
 		ble_peripheral.init()
 		ble_peripheral.set_callbacks(on_state=self.peripheral_state_changed,
 		                             on_service_added=self.peripheral_service_added,
@@ -124,7 +124,7 @@ class ModuleServerApp(App):
 	def start_scanning(self):
 		Logger.info('BLE: start scanning')
 		ble_central.start_scanning(allow_duplicates=False)
-		Clock.schedule_once(self.check_connect, 5)
+		# Clock.schedule_once(self.check_connect, 5)
 		# Clock.schedule_interval(self.check_connect, 0.5)
 
 	def stop_scanning(self):
@@ -145,20 +145,23 @@ class ModuleServerApp(App):
 						self.connect(device)
 						return
 
+	# @mainthread
 	def central_discovered_peripheral(self, device):
 		if self.connecting or self.connected:
 			return
-		self.ble_should_scan = False
-		self.stop_scanning()
 		print('discovered peripheral, state', iprop(device.peripheral.state))
 		uuid_bytes = self.client_base_uuid_bytes
 		for uuid, service in device.services.items():
 			if uuid.bytes[4:] == uuid_bytes:
 				Logger.info('BLE: found device {}'.format(uuid))
+				self.ble_should_scan = False
+				self.stop_scanning()
 				self.connect(device)
 				return
 
+	# @mainthread
 	def connect(self, device):
+		Logger.info('BLE: connecting to device {}'.format(device))
 		# self.ble_should_scan = False
 		# self.stop_scanning()
 		self.connecting = device
