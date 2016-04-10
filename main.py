@@ -1,14 +1,24 @@
+from time import sleep
+
+# import os
+# os.environ['PYOBJUS_DEBUG'] = '1'
+
+import random
 from uuid import UUID, uuid4
 
 import operator
 from kivy import Logger
 from kivy.app import App
+from kivy.config import Config
 from kivy.lang import Builder
 from kivy.properties import BooleanProperty, ObjectProperty
 from kivy.clock import Clock, mainthread
+from struct import pack
 
 from plyer import ble_central, ble_peripheral
 from plyer.utils import iprop
+
+Config.set('kivy', 'log_level', 'debug')
 
 root = lambda: Builder.load_string('''
 BoxLayout:
@@ -36,6 +46,9 @@ class ModuleServerApp(App):
 
 	connecting = ObjectProperty(allownone=True)
 	connected = ObjectProperty(allownone=True)
+	connect_uuid = ObjectProperty(allownone=True)
+
+	streaming_data = BooleanProperty(False)
 
 	base_uuid = '5191-483F-B7B1-3D4745E634AD'
 	client_base_uuid = 'E19E-4D58-8FE4-73B60A0C6312'
@@ -43,6 +56,13 @@ class ModuleServerApp(App):
 
 	# beacon_uuid = UUID(str(uuid4())[:8] + '-' + base_uuid)
 	beacon_uuid = UUID('1234abcd-' + base_uuid)
+
+	# characteristic uuids
+	connection_uuid = UUID('124BA72A-9F9E-4D58-96B8-19562AA06805')
+	module_message_uuid = UUID('81DFAD82-C635-43E3-89A9-C496DE48D70F')
+	client_message_uuid = UUID('20C336BD-FC96-4AA6-A601-8998463E2B2A')
+	module_data_uuid = UUID('1D6C9B50-7FB7-4AF9-8C6E-377441E19251')
+	client_data_uuid = UUID('FA3E71D3-A8A4-4B77-99BF-DCE23E9E29B9')
 
 	def build(self):
 		return root()
@@ -132,18 +152,18 @@ class ModuleServerApp(App):
 		ble_central.stop_scanning()
 		# Clock.unschedule(self.check_connect)
 
-	def check_connect(self, *args):
-		devices = list(sorted(ble_central.devices.values(), key=operator.attrgetter('age')))
-		self.stop_scanning()
-		self.ble_should_scan = False
-		uuid_bytes = self.client_base_uuid_bytes
-		for device in devices:
-			if device.services:
-				for uuid, service in device.services.items():
-					if uuid.bytes[4:] == uuid_bytes:
-						Logger.info('BLE: found device {}'.format(uuid))
-						self.connect(device)
-						return
+	# def check_connect(self, *args):
+	# 	devices = list(sorted(ble_central.devices.values(), key=operator.attrgetter('age')))
+	# 	self.stop_scanning()
+	# 	self.ble_should_scan = False
+	# 	uuid_bytes = self.client_base_uuid_bytes
+	# 	for device in devices:
+	# 		if device.services:
+	# 			for uuid, service in device.services.items():
+	# 				if uuid.bytes[4:] == uuid_bytes:
+	# 					Logger.info('BLE: found device {}'.format(uuid))
+	# 					self.connect(device)
+	# 					return
 
 	# @mainthread
 	def central_discovered_peripheral(self, device):
@@ -156,6 +176,7 @@ class ModuleServerApp(App):
 				Logger.info('BLE: found device {}'.format(uuid))
 				self.ble_should_scan = False
 				self.stop_scanning()
+				self.connect_uuid = uuid
 				self.connect(device)
 				return
 
@@ -184,6 +205,14 @@ class ModuleServerApp(App):
 		Logger.info('BLE: connected to device {}'.format(device))
 		self.connected = device
 
+		# device.discover_services(uuids=(self.connect_uuid,), on_discover=self.on_discover_services)
+		service = device.services[self.connect_uuid]
+		if service:
+			Logger.info('BLE: found service {}'.format(service))
+			self.on_discover_services(device.services, None)
+		else:
+			device.discover_services(on_discover=self.on_discover_services)
+
 	def on_device_disconnect(self, device, error=None):
 		if error:
 			Logger.error('BLE: device disconnected: {}'.format(error))
@@ -192,6 +221,109 @@ class ModuleServerApp(App):
 		self.connected = None
 		self.ble_should_scan = True
 
+	def on_discover_services(self, services, error):
+		if error:
+			Logger.error('BLE: error discovering services: {}'.format(error))
+			return
+
+		Logger.info('BLE: discovered services: {}'.format(services.keys()))
+
+		service = services[self.connect_uuid]
+		if not service:
+			Logger.error('BLE: service not found!')
+			return
+
+		service.discover_characteristics(on_discover=self.on_discover_characteristics)
+
+	def on_discover_characteristics(self, characteristics, error):
+		if error:
+			Logger.error('BLE: error discovering characteristics: {}'.format(error))
+			return
+
+		# Logger.info('BLE: discovered characteristics: {}'.format(characteristics.keys()))
+		for uuid, char in characteristics.items():
+			Logger.info('BLE: discovered characteristic: {} {:02x}'.format(uuid, char.properties))
+			if uuid == self.connection_uuid:
+				Logger.info('BLE: found connection characteristic')
+				char.read(on_read=self.on_connection_established)
+			elif uuid == self.module_message_uuid:
+				Logger.info('BLE: found module message characteristic')
+				self.module_message_characteristic = char
+
+	def on_connection_established(self, characteristic, error):
+		if error:
+			Logger.error('BLE: connection failed: {}'.format(error))
+			self.on_device_disconnect(None)
+			return
+		Logger.info('BLE: connection established {}'.format(repr(characteristic.value)))
+		self.start_data()
+
+	def start_data(self):
+		if not self.streaming_data:
+			self.streaming_data = True
+			self.T1_data = 66
+			self.T2_data = 72
+			self.T3_data = 66
+			self.T4_data = 68
+			self.humid_data = 40
+			self.barom_data = 15
+			self.accelx_data = 0.
+			self.accely_data = 0.
+			self.accelz_data = 0.
+			self.impact_data = 0.
+			self.max_impact_data = 0.
+
+			Clock.schedule_interval(self.stream_data, 0.5)
+			self.stream_data()
+
+	def stop_data(self):
+		if self.streaming_data:
+			self.streaming_data = False
+			Clock.unschedule(self.stream_data)
+
+	def update_value(self, name, fn):
+		data = getattr(self, name + '_data')
+		setattr(self, name + '_data', fn(data))
+
+	def vary_value(self, name, magnitude, distribution=5):
+		bell = sum(random.random() for i in range(distribution)) / float(distribution)
+		variance = bell * 2. - 1.
+		variance *= magnitude
+		self.update_value(name, lambda x: x + variance)
+
+	def set_value(self, name, max_value, distribution=5):
+		bell = sum(random.random() for i in range(distribution)) / float(distribution)
+		value = bell * 2. - 1.
+		value *= max_value
+		self.update_value(name, lambda x: value)
+
+	def stream_data(self, *args):
+		self.vary_value('T1', 0.5)
+		self.vary_value('T2', 1.)
+		self.vary_value('T3', 0.5)
+		self.vary_value('T4', 0.5)
+		self.vary_value('humid', 0.5)
+		self.vary_value('barom', 0.1)
+		self.vary_value('accelx', 0.01)
+		self.vary_value('accely', 0.01)
+		self.vary_value('accelz', 0.01)
+		self.set_value('impact', 20, distribution=10)
+		self.impact_data = abs(self.impact_data)
+		self.max_impact_data = max(self.impact_data, self.max_impact_data)
+
+		char = self.module_message_characteristic
+		# char.write(pack('Bffff', 1, self.T1_data, self.T2_data, self.T3_data, self.T4_data), self.on_char_write)
+		char.write(chr(1) + pack('ffff', self.T1_data, self.T2_data, self.T3_data, self.T4_data), self.on_char_write)
+		char.write(chr(2) + pack('f', self.humid_data), self.on_char_write)
+		char.write(chr(3) + pack('f', self.barom_data), self.on_char_write)
+		char.write(chr(4) + pack('fff', self.accelx_data, self.accely_data, self.accelz_data), self.on_char_write)
+		char.write(chr(5) + pack('ff', self.impact_data, self.max_impact_data), self.on_char_write)
+
+	def on_char_write(self, char, error):
+		if error:
+			Logger.error('BLE: error writing data: {}: {}'.format(char, error))
+		else:
+			Logger.debug('BLE: write successful: {}'.format(char))
 
 if __name__ == '__main__':
 	ModuleServerApp().run()
